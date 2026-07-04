@@ -25,7 +25,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message, InputMediaPhoto, InputMediaVideo
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Forbidden
 from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
@@ -793,8 +793,9 @@ def get_route_for_chat_cached(application: Application, origin_chat_id: int) -> 
         rc = application.bot_data.get("routing_cache") or {}
         row = rc.get(int(origin_chat_id))
         if row and int(row.get("activo", 1)) == 1:
+            # Las evidencias y revisiones se manejan siempre en el mismo grupo origen.
             return {
-                "evidence": _safe_int(row.get("evidence_chat_id")),
+                "evidence": int(origin_chat_id),
                 "summary": _safe_int(row.get("summary_chat_id")),
             }
     except Exception:
@@ -804,13 +805,13 @@ def get_route_for_chat_cached(application: Application, origin_chat_id: int) -> 
         try:
             mapping = json.loads(ROUTING_JSON)
             cfg = mapping.get(str(origin_chat_id)) or {}
-            ev = cfg.get("evidence")
             sm = cfg.get("summary")
-            return {"evidence": int(ev) if ev else None, "summary": int(sm) if sm else None}
+            # Las evidencias y revisiones se manejan siempre en el mismo grupo origen.
+            return {"evidence": int(origin_chat_id), "summary": int(sm) if sm else None}
         except Exception as e:
             log.warning(f"ROUTING_JSON inválido: {e}")
 
-    return {"evidence": None, "summary": None}
+    return {"evidence": int(origin_chat_id), "summary": None}
 
 
 async def maybe_copy_to_group(
@@ -838,6 +839,9 @@ async def send_review_message_with_fallback(
     text: str,
     reply_markup: InlineKeyboardMarkup,
 ) -> None:
+    """Envía mensaje de revisión al grupo configurado y, si no hay acceso,
+    lo envía al grupo origen para que siempre aparezcan los botones admin.
+    """
     target_chat_id = dest_chat_id or origin_chat_id
 
     try:
@@ -846,20 +850,35 @@ async def send_review_message_with_fallback(
             text=text,
             reply_markup=reply_markup,
         )
-    except BadRequest as e:
+        return
+    except (BadRequest, Forbidden) as e:
         err = str(e).lower()
-        if dest_chat_id and ("chat not found" in err or "bot was kicked" in err or "forbidden" in err):
-            log.warning(
-                f"No se pudo enviar revisión al grupo destino {dest_chat_id}: {e}. "
-                f"Enviando revisión al grupo origen {origin_chat_id}."
-            )
+        should_fallback = bool(dest_chat_id) and int(target_chat_id) != int(origin_chat_id) and (
+            "chat not found" in err
+            or "bot was kicked" in err
+            or "forbidden" in err
+            or "not enough rights" in err
+            or "have no rights" in err
+        )
+
+        if not should_fallback:
+            raise
+
+        log.warning(
+            f"No se pudo enviar revisión al grupo destino {dest_chat_id}: {e}. "
+            f"Enviando revisión al grupo origen {origin_chat_id}."
+        )
+
+        try:
             await context.bot.send_message(
                 chat_id=origin_chat_id,
                 text=text,
                 reply_markup=reply_markup,
             )
             return
-        raise
+        except Exception as origin_error:
+            log.error(f"Tampoco se pudo enviar revisión al grupo origen {origin_chat_id}: {origin_error}")
+            raise
 
 
 # =========================
@@ -2350,7 +2369,6 @@ def kb_reopen_menu(case_id: int, mode: str) -> InlineKeyboardMarkup:
 def kb_config_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("🔗 Vincular Evidencias", callback_data="CFG|PAIR|EVIDENCE")],
             [InlineKeyboardButton("🧾 Vincular Resumen", callback_data="CFG|PAIR|SUMMARY")],
             [InlineKeyboardButton("📌 Ver rutas de este grupo", callback_data="CFG|ROUTE|STATUS")],
             [InlineKeyboardButton("❌ Cerrar", callback_data="CFG|CLOSE")],
@@ -3169,7 +3187,7 @@ async def on_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"📌 RUTAS (ORIGEN)\n"
                     f"Alias: {alias}\n"
                     f"Origin chat_id: {chat_id}\n"
-                    f"Evidencias chat_id: {ev or '(no vinculado)'}\n"
+                    f"Evidencias/Revisión: mismo grupo origen\n"
                     f"Resumen chat_id: {sm or '(no vinculado)'}\n"
                     f"Estado: {activo}\n"
                 )
@@ -3195,7 +3213,16 @@ async def on_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if len(parts) >= 3 and parts[1] == "PAIR":
             purpose = parts[2].strip().upper()
-            if purpose not in ("EVIDENCE", "SUMMARY"):
+            if purpose == "EVIDENCE":
+                await safe_q_answer(q, "Evidencias en mismo grupo", show_alert=False)
+                await safe_edit_message_text(
+                    q,
+                    "✅ Las evidencias y revisiones ahora se manejan en este mismo grupo. No se usa evidence_chat_id.",
+                    reply_markup=kb_back_to_config(),
+                )
+                return
+
+            if purpose not in ("SUMMARY",):
                 await safe_q_answer(q, "Opción inválida.", show_alert=True)
                 return
 
@@ -3221,7 +3248,7 @@ async def on_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"Código: {code}\n"
                         f"Vence aprox.: {expires_txt} (Perú)\n\n"
                         f"👉 Ve al grupo DESTINO ({label})\n"
-                        f"y usa /config → {'🔗 Vincular Evidencias' if purpose=='EVIDENCE' else '🧾 Vincular Resumen'}\n"
+                        f"y usa /config → 🧾 Vincular Resumen\n"
                         f"para pegar el código."
                     )
                     await safe_q_answer(q, "Código generado", show_alert=False)
@@ -4001,8 +4028,8 @@ async def on_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_q_answer(q, "Enviado a revisión", show_alert=False)
             await safe_edit_message_text(q, f"✅ Evidencias completas enviadas a revisión: {step_name(step_no)}")
 
-            route = get_route_for_chat_cached(context.application, int(case_row["chat_id"]))
-            dest = route.get("evidence")
+            # Revisión en el mismo grupo origen. No usar evidence_chat_id.
+            dest = int(case_row["chat_id"])
             review_text = (
                 f"🟡 EVIDENCIA EN REVISIÓN\n"
                 f"• Caso: {case_id}\n"
@@ -4334,22 +4361,25 @@ async def on_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             current_step_no=None,
         )
         case_row = get_case(case_id)
-        route = get_route_for_chat_cached(context.application, int(case_row["chat_id"]))
-        dest = route.get("evidence")
+        # Revisión en el mismo grupo origen. No usar evidence_chat_id.
+        dest = int(case_row["chat_id"])
 
         await safe_q_answer(q, "En revisión", show_alert=False)
         await safe_edit_message_text(q, "En proceso de validacion, esperando confirmacion del validador")
-        await context.bot.send_message(
-            chat_id=dest or int(case_row["chat_id"]),
-            text=(
-                "En proceso de validacion, esperando confirmacion del validador\n\n"
-                f"• Caso: {case_id}\n"
-                f"• Técnico: {case_row['technician_name'] or '-'}\n"
-                f"• Servicio: {case_row['service_type'] or '-'}\n"
-                f"• Abonado: {case_row['abonado_code'] or '-'}\n\n"
-                f"{validation_template(case_row)}"
-            ),
-            reply_markup=kb_validation_admin(case_id),
+        validation_review_text = (
+            "En proceso de validacion, esperando confirmacion del validador\n\n"
+            f"• Caso: {case_id}\n"
+            f"• Técnico: {case_row['technician_name'] or '-'}\n"
+            f"• Servicio: {case_row['service_type'] or '-'}\n"
+            f"• Abonado: {case_row['abonado_code'] or '-'}\n\n"
+            f"{validation_template(case_row)}"
+        )
+        await send_review_message_with_fallback(
+            context,
+            dest,
+            int(case_row["chat_id"]),
+            validation_review_text,
+            kb_validation_admin(case_id),
         )
         enqueue_case_sync(case_id)
         return
@@ -4526,10 +4556,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_name = msg.from_user.full_name
 
     pending_evid = pop_pending_input(chat_id, user_id, "PAIR_CODE_EVID")
-    pending_sum = None if pending_evid else pop_pending_input(chat_id, user_id, "PAIR_CODE_SUM")
+    if pending_evid:
+        await context.bot.send_message(chat_id=chat_id, text="✅ Las evidencias se manejan en este mismo grupo. No se requiere vincular evidence_chat_id.")
+        return
 
-    if pending_evid or pending_sum:
-        purpose = "EVIDENCE" if pending_evid else "SUMMARY"
+    pending_sum = pop_pending_input(chat_id, user_id, "PAIR_CODE_SUM")
+
+    if pending_sum:
+        purpose = "SUMMARY"
         dest_kind = purpose
         try:
             res = pairing_consume_and_upsert_routing(
@@ -4690,21 +4724,24 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             mark_submitted(case_id, step_no, attempt)
             update_case(case_id, phase=PHASE_AUTH_REVIEW, pending_step_no=step_no, current_step_no=step_no, admin_pending=1)
 
-            route = get_route_for_chat_cached(context.application, int(case_row["chat_id"]))
-            dest = route.get("evidence")
+            # Revisión en el mismo grupo origen. No usar evidence_chat_id.
+            dest = int(case_row["chat_id"])
 
             await context.bot.send_message(chat_id=chat_id, text="✅ Solicitud enviada a revisión.")
-            await context.bot.send_message(
-                chat_id=dest or chat_id,
-                text=(
-                    f"🟡 SOLICITUD DE PERMISO\n"
-                    f"• Caso: {case_id}\n"
-                    f"• Técnico: {case_row['technician_name'] or '-'}\n"
-                    f"• Código abonado: {case_row['abonado_code'] or '-'}\n"
-                    f"• Paso: {step_name(step_no)}\n"
-                    f"• Solicitud: {text}"
-                ),
-                reply_markup=kb_auth_review(case_id, step_no, attempt),
+            auth_review_text = (
+                f"🟡 SOLICITUD DE PERMISO\n"
+                f"• Caso: {case_id}\n"
+                f"• Técnico: {case_row['technician_name'] or '-'}\n"
+                f"• Código abonado: {case_row['abonado_code'] or '-'}\n"
+                f"• Paso: {step_name(step_no)}\n"
+                f"• Solicitud: {text}"
+            )
+            await send_review_message_with_fallback(
+                context,
+                dest,
+                int(case_row["chat_id"]),
+                auth_review_text,
+                kb_auth_review(case_id, step_no, attempt),
             )
         else:
             set_review(case_id, step_no, attempt, 1, user_id)
@@ -4836,8 +4873,8 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             admin_pending=1,
         )
 
-        route = get_route_for_chat_cached(context.application, int(case_row["chat_id"]))
-        dest = route.get("evidence")
+        # Revisión en el mismo grupo origen. No usar evidence_chat_id.
+        dest = int(case_row["chat_id"])
         receipt_label = step_name(RECEIPT_STEP_NO)
 
         caption = (
@@ -4848,7 +4885,7 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• Abonado: {case_row['abonado_code'] or '-'}\n"
             f"• Persona que atiende: {attendee}"
         )
-        await maybe_copy_to_group(context, dest, "photo", file_id, caption)
+        # No se copia a grupo de evidencias: la revisión se maneja en el mismo grupo origen.
 
         await context.bot.send_message(chat_id=msg.chat_id, text="✅ Foto de recibo enviada a revisión. Espera validación del admin.")
         receipt_review_text = (
@@ -4921,8 +4958,8 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             admin_pending=1,
         )
 
-        route = get_route_for_chat_cached(context.application, int(case_row["chat_id"]))
-        dest = route.get("evidence")
+        # Revisión en el mismo grupo origen. No usar evidence_chat_id.
+        dest = int(case_row["chat_id"])
         doc_label = step_name(doc_step_no)
 
         caption = (
@@ -4933,7 +4970,7 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• Abonado: {case_row['abonado_code'] or '-'}\n"
             f"• Persona que atiende: {attendee}"
         )
-        await maybe_copy_to_group(context, dest, "photo", file_id, caption)
+        # No se copia a grupo de evidencias: la revisión se maneja en el mismo grupo origen.
 
         await context.bot.send_message(chat_id=msg.chat_id, text="✅ Documento enviado a revisión. Espera validación del admin.")
         document_review_text = (
@@ -5025,8 +5062,8 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         meta=meta,
     )
 
-    route = get_route_for_chat_cached(context.application, int(case_row["chat_id"]))
-    dest = route.get("evidence")
+    # Revisión en el mismo grupo origen. No usar evidence_chat_id.
+    dest = int(case_row["chat_id"])
     caption = (
         f"📎 Evidencia recibida\n"
         f"• Caso: {case_id}\n"
@@ -5035,7 +5072,7 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Paso: {step_name(pending_step_no)}\n"
         f"• Intento: {attempt}"
     )
-    await maybe_copy_to_group(context, dest, file_type, file_id, caption)
+    # No se copia a grupo de evidencias: la evidencia ya está en el mismo grupo origen.
 
     upsert_media_ack_buffer(
         chat_id=msg.chat_id,
