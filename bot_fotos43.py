@@ -2502,7 +2502,6 @@ async def send_case_status_summary(chat_id: int, context: ContextTypes.DEFAULT_T
             f"• Bloqueado por: {locked_by}\n"
             f"• En revisión admin: {admin_pending}\n"
         ),
-    )
 
 
 async def show_package_menu(chat_id: int, context: ContextTypes.DEFAULT_TYPE, case_row: sqlite3.Row):
