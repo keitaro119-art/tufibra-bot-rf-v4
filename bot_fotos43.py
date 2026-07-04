@@ -831,6 +831,37 @@ async def maybe_copy_to_group(
         log.warning(f"No pude copiar evidencia a destino {dest_chat_id}: {e}")
 
 
+async def send_review_message_with_fallback(
+    context: ContextTypes.DEFAULT_TYPE,
+    dest_chat_id: Optional[int],
+    origin_chat_id: int,
+    text: str,
+    reply_markup: InlineKeyboardMarkup,
+) -> None:
+    target_chat_id = dest_chat_id or origin_chat_id
+
+    try:
+        await context.bot.send_message(
+            chat_id=target_chat_id,
+            text=text,
+            reply_markup=reply_markup,
+        )
+    except BadRequest as e:
+        err = str(e).lower()
+        if dest_chat_id and ("chat not found" in err or "bot was kicked" in err or "forbidden" in err):
+            log.warning(
+                f"No se pudo enviar revisión al grupo destino {dest_chat_id}: {e}. "
+                f"Enviando revisión al grupo origen {origin_chat_id}."
+            )
+            await context.bot.send_message(
+                chat_id=origin_chat_id,
+                text=text,
+                reply_markup=reply_markup,
+            )
+            return
+        raise
+
+
 # =========================
 # Step state helpers
 # =========================
@@ -2468,22 +2499,8 @@ async def send_case_status_summary(chat_id: int, context: ContextTypes.DEFAULT_T
     document_txt = "APROBADO" if ("document_approved" in case_row.keys() and int(case_row["document_approved"] or 0) == 1) else "PENDIENTE"
     validation_txt = (case_row["validation_status"] or "PENDIENTE") if "validation_status" in case_row.keys() else "PENDIENTE"
 
-    try:
-        await context.bot.send_message(
-            chat_id=dest_chat_id,
-            text=review_text,
-            reply_markup=reply_markup,
-        )
-    except BadRequest as e:
-        if "Chat not found" in str(e):
-            log.warning(f"No se encontró el grupo destino {dest_chat_id}. Enviando revisión al grupo origen {chat_id}.")
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=review_text,
-                reply_markup=reply_markup,
-        )
-        else:
-            raise
+    await context.bot.send_message(
+        chat_id=chat_id,
         text=(
             "📌 ESTADO DEL CASO\n"
             f"• Aprobación: {approval_txt}\n"
@@ -2500,8 +2517,9 @@ async def send_case_status_summary(chat_id: int, context: ContextTypes.DEFAULT_T
             f"• Recibo: {receipt_txt}\n"
             f"• Validación: {validation_txt}\n"
             f"• Bloqueado por: {locked_by}\n"
-            f"• En revisión admin: {admin_pending}\n"
+            f"• En revisión admin: {admin_pending}"
         ),
+    )
 
 
 async def show_package_menu(chat_id: int, context: ContextTypes.DEFAULT_TYPE, case_row: sqlite3.Row):
@@ -3995,10 +4013,12 @@ async def on_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"• Intento: {attempt}\n"
                 f"• Cantidad: {qty}"
             )
-            await context.bot.send_message(
-                chat_id=dest or chat_id,
-                text=review_text,
-                reply_markup=kb_review_step(case_id, step_no, attempt),
+            await send_review_message_with_fallback(
+                context,
+                dest,
+                chat_id,
+                review_text,
+                kb_review_step(case_id, step_no, attempt),
             )
         else:
             set_review(case_id, step_no, attempt, 1, user_id)
@@ -4831,16 +4851,19 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await maybe_copy_to_group(context, dest, "photo", file_id, caption)
 
         await context.bot.send_message(chat_id=msg.chat_id, text="✅ Foto de recibo enviada a revisión. Espera validación del admin.")
-        await context.bot.send_message(
-            chat_id=dest or msg.chat_id,
-            text=(
-                f"🔎 Revisión requerida - {receipt_label}\n"
-                f"Técnico: {case_row['technician_name'] or '-'}\n"
-                f"Servicio: {case_row['service_type'] or '-'}\n"
-                f"Abonado: {case_row['abonado_code'] or '-'}\n\n"
-                f"Admins: validar con ✅ APROBADO o ❌ RECHAZADO"
-            ),
-            reply_markup=kb_receipt_review(case_id, RECEIPT_STEP_NO, attempt),
+        receipt_review_text = (
+            f"🔎 Revisión requerida - {receipt_label}\n"
+            f"Técnico: {case_row['technician_name'] or '-'}\n"
+            f"Servicio: {case_row['service_type'] or '-'}\n"
+            f"Abonado: {case_row['abonado_code'] or '-'}\n\n"
+            f"Admins: validar con ✅ APROBADO o ❌ RECHAZADO"
+        )
+        await send_review_message_with_fallback(
+            context,
+            dest,
+            msg.chat_id,
+            receipt_review_text,
+            kb_receipt_review(case_id, RECEIPT_STEP_NO, attempt),
         )
 
         enqueue_media_sync(case_id, RECEIPT_STEP_NO, attempt, receipt_label)
@@ -4913,16 +4936,19 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await maybe_copy_to_group(context, dest, "photo", file_id, caption)
 
         await context.bot.send_message(chat_id=msg.chat_id, text="✅ Documento enviado a revisión. Espera validación del admin.")
-        await context.bot.send_message(
-            chat_id=dest or msg.chat_id,
-            text=(
-                f"🔎 Revisión requerida - {doc_label}\n"
-                f"Técnico: {case_row['technician_name'] or '-'}\n"
-                f"Servicio: {case_row['service_type'] or '-'}\n"
-                f"Abonado: {case_row['abonado_code'] or '-'}\n\n"
-                f"Admins: validar con ✅ APROBADO o ❌ RECHAZADO"
-            ),
-            reply_markup=kb_document_review(case_id, doc_step_no, attempt),
+        document_review_text = (
+            f"🔎 Revisión requerida - {doc_label}\n"
+            f"Técnico: {case_row['technician_name'] or '-'}\n"
+            f"Servicio: {case_row['service_type'] or '-'}\n"
+            f"Abonado: {case_row['abonado_code'] or '-'}\n\n"
+            f"Admins: validar con ✅ APROBADO o ❌ RECHAZADO"
+        )
+        await send_review_message_with_fallback(
+            context,
+            dest,
+            msg.chat_id,
+            document_review_text,
+            kb_document_review(case_id, doc_step_no, attempt),
         )
 
         enqueue_media_sync(case_id, doc_step_no, attempt, doc_label)
