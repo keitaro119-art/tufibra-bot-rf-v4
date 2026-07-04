@@ -2468,8 +2468,22 @@ async def send_case_status_summary(chat_id: int, context: ContextTypes.DEFAULT_T
     document_txt = "APROBADO" if ("document_approved" in case_row.keys() and int(case_row["document_approved"] or 0) == 1) else "PENDIENTE"
     validation_txt = (case_row["validation_status"] or "PENDIENTE") if "validation_status" in case_row.keys() else "PENDIENTE"
 
-    await context.bot.send_message(
-        chat_id=chat_id,
+    try:
+        await context.bot.send_message(
+            chat_id=dest_chat_id,
+            text=review_text,
+            reply_markup=reply_markup,
+        )
+    except BadRequest as e:
+        if "Chat not found" in str(e):
+            log.warning(f"No se encontró el grupo destino {dest_chat_id}. Enviando revisión al grupo origen {chat_id}.")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=review_text,
+                reply_markup=reply_markup,
+        )
+        else:
+            raise
         text=(
             "📌 ESTADO DEL CASO\n"
             f"• Aprobación: {approval_txt}\n"
